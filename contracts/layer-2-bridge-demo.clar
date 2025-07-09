@@ -7,13 +7,29 @@
 (define-constant ERR_DEPOSIT_NOT_FOUND (err u105))
 (define-constant ERR_ALREADY_WITHDRAWN (err u106))
 (define-constant ERR_INVALID_SIGNATURE (err u107))
+(define-constant ERR_TRANSACTION_LIMIT_EXCEEDED (err u108))
 
 (define-data-var bridge-paused bool false)
 (define-data-var bridge-fee uint u1000)
 (define-data-var total-locked uint u0)
 (define-data-var deposit-nonce uint u0)
+(define-data-var transaction-counter uint u0)
 
 (define-map user-balances principal uint)
+(define-map transaction-history
+  uint
+  {
+    user: principal,
+    tx-type: (string-ascii 20),
+    amount: uint,
+    timestamp: uint,
+    target-chain: (optional (string-ascii 20)),
+    target-address: (optional (string-ascii 64)),
+    deposit-id: (optional uint),
+    status: (string-ascii 20)
+  }
+)
+(define-map user-transaction-lists principal (list 100 uint))
 (define-map locked-deposits 
   uint 
   {
@@ -80,6 +96,7 @@
     (try! (stx-transfer? amount sender (as-contract tx-sender)))
     (map-set user-balances sender (+ current-balance amount))
     (var-set total-locked (+ (var-get total-locked) amount))
+    (try! (record-transaction sender "deposit" amount none none none "completed"))
     
     (ok amount)
   )
@@ -97,6 +114,7 @@
     (try! (as-contract (stx-transfer? amount tx-sender sender)))
     (map-set user-balances sender (- current-balance amount))
     (var-set total-locked (- (var-get total-locked) amount))
+    (try! (record-transaction sender "withdraw" amount none none none "completed"))
     
     (ok amount)
   )
@@ -126,6 +144,7 @@
       withdrawn: false
     })
     (var-set deposit-nonce new-nonce)
+    (try! (record-transaction sender "bridge-to-l2" amount (some target-chain) (some target-address) (some new-nonce) "completed"))
     
     (ok new-nonce)
   )
@@ -143,6 +162,7 @@
     
     (map-set locked-deposits deposit-id (merge deposit-info { withdrawn: true }))
     (map-set user-balances original-user (+ current-balance amount))
+    (try! (record-transaction original-user "bridge-from-l2" amount none none (some deposit-id) "completed"))
     
     (ok deposit-id)
   )
@@ -257,6 +277,52 @@
       fee: fee,
       total: (+ amount fee)
     }
+  )
+)
+
+(define-private (record-transaction (user principal) (tx-type (string-ascii 20)) (amount uint) (target-chain (optional (string-ascii 20))) (target-address (optional (string-ascii 64))) (deposit-id (optional uint)) (status (string-ascii 20)))
+  (let (
+    (current-counter (var-get transaction-counter))
+    (new-counter (+ current-counter u1))
+    (current-user-txs (default-to (list) (map-get? user-transaction-lists user)))
+  )
+    (map-set transaction-history new-counter {
+      user: user,
+      tx-type: tx-type,
+      amount: amount,
+      timestamp: stacks-block-height,
+      target-chain: target-chain,
+      target-address: target-address,
+      deposit-id: deposit-id,
+      status: status
+    })
+    (map-set user-transaction-lists user (unwrap! (as-max-len? (append current-user-txs new-counter) u100) (err u108)))
+    (var-set transaction-counter new-counter)
+    (ok new-counter)
+  )
+)
+
+(define-read-only (get-transaction-history (tx-id uint))
+  (map-get? transaction-history tx-id)
+)
+
+(define-read-only (get-user-transaction-list (user principal))
+  (default-to (list) (map-get? user-transaction-lists user))
+)
+
+(define-read-only (get-user-transaction-count (user principal))
+  (len (get-user-transaction-list user))
+)
+
+(define-read-only (get-last-n-transactions (user principal) (count uint))
+  (let (
+    (user-txs (get-user-transaction-list user))
+    (tx-list-len (len user-txs))
+  )
+    (if (> count tx-list-len)
+      user-txs
+      (default-to (list) (slice? user-txs (- tx-list-len count) tx-list-len))
+    )
   )
 )
 
