@@ -8,12 +8,16 @@
 (define-constant ERR_ALREADY_WITHDRAWN (err u106))
 (define-constant ERR_INVALID_SIGNATURE (err u107))
 (define-constant ERR_TRANSACTION_LIMIT_EXCEEDED (err u108))
+(define-constant ERR_WITHDRAWAL_LOCKED (err u109))
+(define-constant ERR_INVALID_TIMELOCK_PERIOD (err u110))
 
 (define-data-var bridge-paused bool false)
 (define-data-var bridge-fee uint u1000)
 (define-data-var total-locked uint u0)
 (define-data-var deposit-nonce uint u0)
 (define-data-var transaction-counter uint u0)
+(define-data-var withdrawal-timelock-period uint u144)
+(define-data-var emergency-timelock-period uint u1008)
 
 (define-map user-balances principal uint)
 (define-map transaction-history
@@ -59,6 +63,19 @@
   }
 )
 
+(define-map timelock-withdrawals
+  uint
+  {
+    user: principal,
+    amount: uint,
+    unlock-height: uint,
+    withdrawn: bool,
+    emergency-override: bool
+  }
+)
+
+(define-map user-timelock-nonces principal uint)
+
 (define-read-only (get-bridge-status)
   {
     paused: (var-get bridge-paused),
@@ -84,6 +101,17 @@
   (map-get? withdrawal-proofs proof-id)
 )
 
+(define-read-only (get-timelock-withdrawal (timelock-id uint))
+  (map-get? timelock-withdrawals timelock-id)
+)
+
+(define-read-only (get-timelock-settings)
+  {
+    withdrawal-period: (var-get withdrawal-timelock-period),
+    emergency-period: (var-get emergency-timelock-period)
+  }
+)
+
 (define-public (deposit-tokens (amount uint))
   (let (
     (sender tx-sender)
@@ -99,6 +127,52 @@
     (try! (record-transaction sender "deposit" amount none none none "completed"))
     
     (ok amount)
+  )
+)
+
+(define-public (initiate-timelock-withdrawal (amount uint))
+  (let (
+    (sender tx-sender)
+    (current-balance (get-user-balance sender))
+    (current-nonce (default-to u0 (map-get? user-timelock-nonces sender)))
+    (new-nonce (+ current-nonce u1))
+    (unlock-height (+ stacks-block-height (var-get withdrawal-timelock-period)))
+  )
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    (asserts! (>= current-balance amount) ERR_INSUFFICIENT_BALANCE)
+    (asserts! (not (var-get bridge-paused)) ERR_BRIDGE_PAUSED)
+    
+    (map-set user-balances sender (- current-balance amount))
+    (map-set timelock-withdrawals new-nonce {
+      user: sender,
+      amount: amount,
+      unlock-height: unlock-height,
+      withdrawn: false,
+      emergency-override: false
+    })
+    (map-set user-timelock-nonces sender new-nonce)
+    (try! (record-transaction sender "timelock-init" amount none none (some new-nonce) "pending"))
+    
+    (ok new-nonce)
+  )
+)
+
+(define-public (complete-timelock-withdrawal (timelock-id uint))
+  (let (
+    (withdrawal-info (unwrap! (map-get? timelock-withdrawals timelock-id) ERR_DEPOSIT_NOT_FOUND))
+    (sender tx-sender)
+  )
+    (asserts! (is-eq (get user withdrawal-info) sender) ERR_UNAUTHORIZED)
+    (asserts! (not (get withdrawn withdrawal-info)) ERR_ALREADY_WITHDRAWN)
+    (asserts! (or (>= stacks-block-height (get unlock-height withdrawal-info)) 
+                  (get emergency-override withdrawal-info)) ERR_WITHDRAWAL_LOCKED)
+    
+    (try! (as-contract (stx-transfer? (get amount withdrawal-info) tx-sender sender)))
+    (map-set timelock-withdrawals timelock-id (merge withdrawal-info { withdrawn: true }))
+    (var-set total-locked (- (var-get total-locked) (get amount withdrawal-info)))
+    (try! (record-transaction sender "timelock-complete" (get amount withdrawal-info) none none (some timelock-id) "completed"))
+    
+    (ok (get amount withdrawal-info))
   )
 )
 
@@ -250,6 +324,33 @@
     (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
     (var-set bridge-paused false)
     (ok true)
+  )
+)
+
+(define-public (emergency-override-timelock (timelock-id uint))
+  (let (
+    (withdrawal-info (unwrap! (map-get? timelock-withdrawals timelock-id) ERR_DEPOSIT_NOT_FOUND))
+  )
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (not (get withdrawn withdrawal-info)) ERR_ALREADY_WITHDRAWN)
+    
+    (map-set timelock-withdrawals timelock-id (merge withdrawal-info { emergency-override: true }))
+    (try! (record-transaction (get user withdrawal-info) "emergency-override" (get amount withdrawal-info) none none (some timelock-id) "override"))
+    
+    (ok timelock-id)
+  )
+)
+
+(define-public (set-timelock-periods (withdrawal-period uint) (emergency-period uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (and (> withdrawal-period u0) (> emergency-period u0)) ERR_INVALID_TIMELOCK_PERIOD)
+    (asserts! (>= emergency-period withdrawal-period) ERR_INVALID_TIMELOCK_PERIOD)
+    
+    (var-set withdrawal-timelock-period withdrawal-period)
+    (var-set emergency-timelock-period emergency-period)
+    
+    (ok { withdrawal-period: withdrawal-period, emergency-period: emergency-period })
   )
 )
 
