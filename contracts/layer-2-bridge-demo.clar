@@ -18,6 +18,9 @@
 (define-data-var transaction-counter uint u0)
 (define-data-var withdrawal-timelock-period uint u144)
 (define-data-var emergency-timelock-period uint u1008)
+(define-data-var total-volume-processed uint u0)
+(define-data-var total-fees-collected uint u0)
+(define-data-var bridge-launch-height uint u0)
 
 (define-map user-balances principal uint)
 (define-map transaction-history
@@ -75,6 +78,8 @@
 )
 
 (define-map user-timelock-nonces principal uint)
+(define-map daily-volume-tracking uint uint)
+(define-map chain-volume-stats (string-ascii 20) uint)
 
 (define-read-only (get-bridge-status)
   {
@@ -112,6 +117,54 @@
   }
 )
 
+(define-read-only (get-bridge-analytics)
+  (let (
+    (uptime-blocks (if (> (var-get bridge-launch-height) u0) 
+                      (- stacks-block-height (var-get bridge-launch-height)) 
+                      u0))
+    (total-transactions (var-get transaction-counter))
+  )
+    {
+      total-volume: (var-get total-volume-processed),
+      total-fees: (var-get total-fees-collected),
+      total-locked: (var-get total-locked),
+      total-transactions: total-transactions,
+      uptime-blocks: uptime-blocks,
+      average-tx-size: (if (> total-transactions u0) 
+                          (/ (var-get total-volume-processed) total-transactions) 
+                          u0)
+    }
+  )
+)
+
+(define-read-only (get-daily-volume (day-offset uint))
+  (default-to u0 (map-get? daily-volume-tracking day-offset))
+)
+
+(define-read-only (get-chain-volume (chain-name (string-ascii 20)))
+  (default-to u0 (map-get? chain-volume-stats chain-name))
+)
+
+(define-read-only (get-bridge-performance)
+  (let (
+    (total-txs (var-get transaction-counter))
+    (total-vol (var-get total-volume-processed))
+    (uptime (if (> (var-get bridge-launch-height) u0) 
+               (- stacks-block-height (var-get bridge-launch-height)) 
+               u0))
+  )
+    {
+      utilization-rate: (if (> (var-get total-locked) u0) 
+                           (/ (* total-vol u100) (var-get total-locked)) 
+                           u0),
+      avg-volume-per-block: (if (> uptime u0) (/ total-vol uptime) u0),
+      fee-efficiency: (if (> total-vol u0) 
+                         (/ (* (var-get total-fees-collected) u100) total-vol) 
+                         u0)
+    }
+  )
+)
+
 (define-public (deposit-tokens (amount uint))
   (let (
     (sender tx-sender)
@@ -124,6 +177,7 @@
     (try! (stx-transfer? amount sender (as-contract tx-sender)))
     (map-set user-balances sender (+ current-balance amount))
     (var-set total-locked (+ (var-get total-locked) amount))
+    (unwrap-panic (update-analytics amount u0 none))
     (try! (record-transaction sender "deposit" amount none none none "completed"))
     
     (ok amount)
@@ -188,6 +242,7 @@
     (try! (as-contract (stx-transfer? amount tx-sender sender)))
     (map-set user-balances sender (- current-balance amount))
     (var-set total-locked (- (var-get total-locked) amount))
+    (unwrap-panic (update-analytics amount u0 none))
     (try! (record-transaction sender "withdraw" amount none none none "completed"))
     
     (ok amount)
@@ -218,6 +273,7 @@
       withdrawn: false
     })
     (var-set deposit-nonce new-nonce)
+    (unwrap-panic (update-analytics amount fee (some target-chain)))
     (try! (record-transaction sender "bridge-to-l2" amount (some target-chain) (some target-address) (some new-nonce) "completed"))
     
     (ok new-nonce)
@@ -424,6 +480,42 @@
       user-txs
       (default-to (list) (slice? user-txs (- tx-list-len count) tx-list-len))
     )
+  )
+)
+
+(define-private (update-analytics (amount uint) (fee uint) (chain (optional (string-ascii 20))))
+  (let (
+    (current-volume (var-get total-volume-processed))
+    (current-fees (var-get total-fees-collected))
+    (day-key (/ stacks-block-height u144))
+    (current-daily-volume (default-to u0 (map-get? daily-volume-tracking day-key)))
+  )
+    (if (is-eq (var-get bridge-launch-height) u0)
+      (var-set bridge-launch-height stacks-block-height)
+      true
+    )
+    (var-set total-volume-processed (+ current-volume amount))
+    (var-set total-fees-collected (+ current-fees fee))
+    (map-set daily-volume-tracking day-key (+ current-daily-volume amount))
+    (if (is-some chain)
+      (let (
+        (chain-name (unwrap-panic chain))
+        (current-chain-volume (default-to u0 (map-get? chain-volume-stats chain-name)))
+      )
+        (map-set chain-volume-stats chain-name (+ current-chain-volume amount))
+      )
+      true
+    )
+    (ok true)
+  )
+)
+
+(define-public (initialize-bridge-analytics)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (is-eq (var-get bridge-launch-height) u0) ERR_UNAUTHORIZED)
+    (var-set bridge-launch-height stacks-block-height)
+    (ok stacks-block-height)
   )
 )
 
