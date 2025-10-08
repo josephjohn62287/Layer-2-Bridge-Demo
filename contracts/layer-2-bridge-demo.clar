@@ -10,6 +10,8 @@
 (define-constant ERR_TRANSACTION_LIMIT_EXCEEDED (err u108))
 (define-constant ERR_WITHDRAWAL_LOCKED (err u109))
 (define-constant ERR_INVALID_TIMELOCK_PERIOD (err u110))
+(define-constant ERR_NO_REBATE_AVAILABLE (err u111))
+(define-constant ERR_INVALID_TIER (err u112))
 
 (define-data-var bridge-paused bool false)
 (define-data-var bridge-fee uint u1000)
@@ -21,6 +23,10 @@
 (define-data-var total-volume-processed uint u0)
 (define-data-var total-fees-collected uint u0)
 (define-data-var bridge-launch-height uint u0)
+(define-data-var rebate-pool uint u0)
+(define-data-var rebate-tier-1-threshold uint u1000000)
+(define-data-var rebate-tier-2-threshold uint u5000000)
+(define-data-var rebate-tier-3-threshold uint u10000000)
 
 (define-map user-balances principal uint)
 (define-map transaction-history
@@ -80,6 +86,8 @@
 (define-map user-timelock-nonces principal uint)
 (define-map daily-volume-tracking uint uint)
 (define-map chain-volume-stats (string-ascii 20) uint)
+(define-map user-lifetime-volume principal uint)
+(define-map user-rebate-balance principal uint)
 
 (define-read-only (get-bridge-status)
   {
@@ -163,6 +171,48 @@
                          u0)
     }
   )
+)
+
+(define-read-only (get-user-loyalty-tier (user principal))
+  (let (
+    (lifetime-vol (default-to u0 (map-get? user-lifetime-volume user)))
+    (tier-1 (var-get rebate-tier-1-threshold))
+    (tier-2 (var-get rebate-tier-2-threshold))
+    (tier-3 (var-get rebate-tier-3-threshold))
+  )
+    {
+      tier: (if (>= lifetime-vol tier-3) u3
+              (if (>= lifetime-vol tier-2) u2
+                (if (>= lifetime-vol tier-1) u1 u0))),
+      lifetime-volume: lifetime-vol,
+      rebate-rate: (if (>= lifetime-vol tier-3) u15
+                     (if (>= lifetime-vol tier-2) u10
+                       (if (>= lifetime-vol tier-1) u5 u0))),
+      next-tier-volume: (if (>= lifetime-vol tier-3) u0
+                          (if (>= lifetime-vol tier-2) (- tier-3 lifetime-vol)
+                            (if (>= lifetime-vol tier-1) (- tier-2 lifetime-vol)
+                              (- tier-1 lifetime-vol))))
+    }
+  )
+)
+
+(define-read-only (get-user-rebate-info (user principal))
+  {
+    available-rebate: (default-to u0 (map-get? user-rebate-balance user)),
+    lifetime-volume: (default-to u0 (map-get? user-lifetime-volume user)),
+    rebate-pool-total: (var-get rebate-pool)
+  }
+)
+
+(define-read-only (get-rebate-tier-thresholds)
+  {
+    tier-1: (var-get rebate-tier-1-threshold),
+    tier-2: (var-get rebate-tier-2-threshold),
+    tier-3: (var-get rebate-tier-3-threshold),
+    tier-1-rate: u5,
+    tier-2-rate: u10,
+    tier-3-rate: u15
+  }
 )
 
 (define-public (deposit-tokens (amount uint))
@@ -274,6 +324,7 @@
     })
     (var-set deposit-nonce new-nonce)
     (unwrap-panic (update-analytics amount fee (some target-chain)))
+    (unwrap-panic (process-fee-rebate sender fee))
     (try! (record-transaction sender "bridge-to-l2" amount (some target-chain) (some target-address) (some new-nonce) "completed"))
     
     (ok new-nonce)
@@ -507,6 +558,84 @@
       true
     )
     (ok true)
+  )
+)
+
+(define-private (process-fee-rebate (user principal) (fee uint))
+  (let (
+    (lifetime-vol (default-to u0 (map-get? user-lifetime-volume user)))
+    (new-lifetime-vol (+ lifetime-vol fee))
+    (tier-1 (var-get rebate-tier-1-threshold))
+    (tier-2 (var-get rebate-tier-2-threshold))
+    (tier-3 (var-get rebate-tier-3-threshold))
+    (rebate-rate (if (>= new-lifetime-vol tier-3) u15
+                   (if (>= new-lifetime-vol tier-2) u10
+                     (if (>= new-lifetime-vol tier-1) u5 u0))))
+    (rebate-amount (/ (* fee rebate-rate) u100))
+    (current-rebate (default-to u0 (map-get? user-rebate-balance user)))
+    (current-pool (var-get rebate-pool))
+  )
+    (map-set user-lifetime-volume user new-lifetime-vol)
+    (if (> rebate-amount u0)
+      (begin
+        (map-set user-rebate-balance user (+ current-rebate rebate-amount))
+        (var-set rebate-pool (+ current-pool rebate-amount))
+      )
+      true
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-rebate)
+  (let (
+    (sender tx-sender)
+    (rebate-amount (default-to u0 (map-get? user-rebate-balance sender)))
+    (pool-balance (var-get rebate-pool))
+  )
+    (asserts! (> rebate-amount u0) ERR_NO_REBATE_AVAILABLE)
+    (asserts! (>= pool-balance rebate-amount) ERR_INSUFFICIENT_BALANCE)
+    
+    (try! (as-contract (stx-transfer? rebate-amount tx-sender sender)))
+    (map-set user-rebate-balance sender u0)
+    (var-set rebate-pool (- pool-balance rebate-amount))
+    
+    (ok rebate-amount)
+  )
+)
+
+(define-public (set-rebate-tier-threshold (tier uint) (threshold uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= tier u3) ERR_INVALID_TIER)
+    (asserts! (> threshold u0) ERR_INVALID_AMOUNT)
+    
+    (if (is-eq tier u1)
+      (var-set rebate-tier-1-threshold threshold)
+      (if (is-eq tier u2)
+        (var-set rebate-tier-2-threshold threshold)
+        (if (is-eq tier u3)
+          (var-set rebate-tier-3-threshold threshold)
+          false
+        )
+      )
+    )
+    (ok threshold)
+  )
+)
+
+(define-public (fund-rebate-pool (amount uint))
+  (let (
+    (sender tx-sender)
+    (current-pool (var-get rebate-pool))
+  )
+    (asserts! (is-eq sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (> amount u0) ERR_INVALID_AMOUNT)
+    
+    (try! (stx-transfer? amount sender (as-contract tx-sender)))
+    (var-set rebate-pool (+ current-pool amount))
+    
+    (ok amount)
   )
 )
 
