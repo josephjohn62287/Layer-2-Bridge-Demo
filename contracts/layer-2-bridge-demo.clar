@@ -669,3 +669,34 @@
 ;;     (filter-user-deposits user u1 current-nonce)
 ;;   )
 ;; )
+
+(define-read-only (simulate-bridge-impact (amount uint) (chain (optional (string-ascii 20))))
+  (let (
+    (fee (var-get bridge-fee))
+    (total (if (> amount u0) (+ amount fee) u0))
+    (new-total-locked (+ (var-get total-locked) amount))
+    (new-total-volume (+ (var-get total-volume-processed) amount))
+    (new-total-fees (+ (var-get total-fees-collected) fee))
+    (day-key (/ stacks-block-height u144))
+    (current-daily-volume (default-to u0 (map-get? daily-volume-tracking day-key)))
+    (new-daily-volume (+ current-daily-volume amount))
+    (new-chain-volume (if (is-some chain)
+                         (+ (default-to u0 (map-get? chain-volume-stats (unwrap-panic chain))) amount)
+                         u0))
+    (projected-tx-count (+ (var-get transaction-counter) u1))
+  )
+    {
+      amount: amount,
+      fee: fee,
+      total: total,
+      new-total-locked: new-total-locked,
+      new-total-volume: new-total-volume,
+      new-total-fees: new-total-fees,
+      new-daily-volume: new-daily-volume,
+      new-chain-volume: new-chain-volume,
+      projected-average-tx-size: (if (> projected-tx-count u0)
+                                   (/ new-total-volume projected-tx-count)
+                                   u0)
+    }
+  )
+)
